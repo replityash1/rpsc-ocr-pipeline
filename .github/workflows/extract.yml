@@ -1,0 +1,229 @@
+name: Extract RPSC/RAS Questions
+
+on:
+  push:
+    paths:
+      - "input/**.pdf"
+  workflow_dispatch:
+    inputs:
+      pdf_filename:
+        description: "Filename inside input/ to (re)process. Leave blank to auto-detect the most recently added PDF."
+        required: false
+        default: ""
+
+concurrency:
+  group: extract-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PY_VERSION: "3.11"
+  CONFIG_PATH: config/pipeline_config.yaml
+  # Bump this when you deliberately want to force a fresh model download
+  # (e.g. after pinning a new PaddleOCR-VL version in requirements.txt)
+  MODEL_CACHE_VERSION: v1
+
+jobs:
+  # ===========================================================================
+  # STAGE 1 — detect the PDF, render+clean pages, compute the parallel matrix
+  # ===========================================================================
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      doc_stem: ${{ steps.manifest.outputs.doc_stem }}
+      pdf_path: ${{ steps.find_pdf.outputs.pdf_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install lightweight preprocessing deps only
+        # The discover job never loads PaddleOCR-VL, so we skip that heavy
+        # install here and only pay for it in the OCR matrix jobs.
+        run: |
+          pip install pymupdf==1.24.14 opencv-python-headless==4.10.0.84 \
+                      numpy==1.26.4 PyYAML==6.0.2
+
+      - name: Locate target PDF
+        id: find_pdf
+        run: |
+          if [ -n "${{ github.event.inputs.pdf_filename }}" ]; then
+            PDF="input/${{ github.event.inputs.pdf_filename }}"
+          else
+            PDF=$(git log -1 --name-only --diff-filter=A --pretty=format: -- 'input/*.pdf' | head -n 1)
+            if [ -z "$PDF" ]; then
+              PDF=$(ls -t input/*.pdf | head -n 1)
+            fi
+          fi
+          if [ ! -f "$PDF" ]; then
+            echo "::error::Could not find a PDF to process at $PDF"
+            exit 1
+          fi
+          echo "pdf_path=$PDF" >> "$GITHUB_OUTPUT"
+          echo "Resolved PDF: $PDF"
+
+      - name: Render pages + build matrix
+        run: |
+          python scripts/preprocess.py "${{ steps.find_pdf.outputs.pdf_path }}" work "${{ env.CONFIG_PATH }}"
+
+      - name: Emit matrix output
+        id: matrix
+        run: |
+          echo "matrix=$(cat work/matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Emit manifest output
+        id: manifest
+        run: |
+          echo "doc_stem=$(python -c "import json;print(json.load(open('work/manifest.json'))['doc_stem'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload page images
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-images
+          path: work/pages/
+          retention-days: 1
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: work/manifest.json
+          retention-days: 1
+
+  # ===========================================================================
+  # STAGE 2 — OCR each batch of pages in parallel (PaddleOCR-VL + Tesseract)
+  # ===========================================================================
+  ocr:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix).include }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install system OCR dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-hin tesseract-ocr-eng
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      # PaddleOCR-VL model weights (~1.5GB) are the single biggest time cost
+      # if re-downloaded on every run. Caching them turns every run after the
+      # first into a "load from disk" instead of a "download from HF/BOS".
+      - name: Cache PaddleOCR-VL model weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.paddlex
+            ~/.paddleocr
+            ~/.cache/huggingface
+          key: paddleocr-vl-${{ env.MODEL_CACHE_VERSION }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download page images
+        uses: actions/download-artifact@v4
+        with:
+          name: page-images
+          path: work/pages
+
+      - name: Run OCR on assigned batch (pages ${{ matrix.start_page }}-${{ matrix.end_page }})
+        run: |
+          python scripts/ocr_batch.py work/pages "${{ matrix.start_page }}" "${{ matrix.end_page }}" \
+            work/ocr_out/batch_${{ matrix.batch_id }} "${{ env.CONFIG_PATH }}"
+
+      - name: Upload batch OCR results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-batch-${{ matrix.batch_id }}
+          path: work/ocr_out/batch_${{ matrix.batch_id }}/
+          retention-days: 1
+
+  # ===========================================================================
+  # STAGE 3 — merge all batches, structure into questions, validate, commit
+  # ===========================================================================
+  structure_and_validate:
+    needs: [discover, ocr]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install lightweight structuring deps only
+        run: |
+          pip install PyYAML==6.0.2 rapidfuzz==3.9.7
+
+      - name: Download manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: manifest
+          path: work
+
+      - name: Download all OCR batch outputs (merged into one directory)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ocr-batch-*
+          path: work/ocr_out
+          merge-multiple: true
+
+      - name: Structure questions (deterministic, no generative model)
+        run: |
+          python scripts/structure_questions.py work/ocr_out "${{ env.CONFIG_PATH }}" \
+            work/manifest.json work/structured.json
+
+      - name: Validate + split clean vs review queue
+        run: |
+          DOC_STEM="${{ needs.discover.outputs.doc_stem }}"
+          mkdir -p "output/$DOC_STEM"
+          python scripts/validate.py work/structured.json work/ocr_out \
+            "${{ env.CONFIG_PATH }}" "output/$DOC_STEM"
+
+      - name: Copy extracted figures into output
+        run: |
+          DOC_STEM="${{ needs.discover.outputs.doc_stem }}"
+          mkdir -p "output/$DOC_STEM/figures"
+          find work/ocr_out -path "*/figures/*.png" -exec cp {} "output/$DOC_STEM/figures/" \; 2>/dev/null || true
+
+      - name: Upload final results as workflow artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-output-${{ needs.discover.outputs.doc_stem }}
+          path: output/${{ needs.discover.outputs.doc_stem }}/
+          retention-days: 90
+
+      - name: Commit results to output/
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Extract questions from ${{ needs.discover.outputs.doc_stem }}.pdf [skip ci]"
+          file_pattern: "output/**"
