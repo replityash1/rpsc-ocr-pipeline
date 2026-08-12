@@ -34,6 +34,21 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _get_val(obj, *keys_or_attrs, default=None):
+    """Safely fetch a key or attribute from a dict or object."""
+    if isinstance(obj, dict):
+        for key in keys_or_attrs:
+            if key in obj and obj[key] is not None:
+                return obj[key]
+    else:
+        for attr in keys_or_attrs:
+            if hasattr(obj, attr):
+                val = getattr(obj, attr)
+                if val is not None:
+                    return val
+    return default
+
+
 def run_paddleocr_vl(image_path: Path, pipeline):
     """Returns (markdown:str, blocks:list, mean_confidence:float|None)."""
     results = pipeline.predict(str(image_path))
@@ -41,17 +56,18 @@ def run_paddleocr_vl(image_path: Path, pipeline):
     blocks = []
     confidences = []
     for res in results:
-        md = res.get("markdown", "")
-        markdown_parts.append(md)
-        # `res` also exposes a parsing_res_list / layout dict depending on
-        # PaddleOCR-VL version; we defensively pull whatever block-level
-        # info is available so downstream stages degrade gracefully.
-        layout_blocks = res.get("layout_parsing_result") or res.get("parsing_res_list") or []
+        md = _get_val(res, "markdown", default="")
+        if md:
+            markdown_parts.append(md)
+
+        layout_blocks = _get_val(res, "layout_parsing_result", "parsing_res_list", default=[])
         if isinstance(layout_blocks, list):
             blocks.extend(layout_blocks)
-        rec_scores = res.get("rec_scores") or res.get("text_scores")
+
+        rec_scores = _get_val(res, "rec_scores", "text_scores")
         if rec_scores:
             confidences.extend([s for s in rec_scores if isinstance(s, (int, float))])
+
     mean_conf = sum(confidences) / len(confidences) if confidences else None
     return "\n".join(markdown_parts), blocks, mean_conf
 
@@ -67,8 +83,7 @@ def run_tesseract(image_path: Path, langs: str) -> str:
 
 def crop_figures(image_path: Path, blocks: list, out_dir: Path, page_num: int) -> list:
     """Pull out figure/chart/table/map regions as standalone images using
-    layout bounding boxes reported by PaddleOCR-VL. Figures are kept as
-    images rather than re-described in text, per spec."""
+    layout bounding boxes reported by PaddleOCR-VL."""
     figure_labels = {"image", "figure", "chart", "picture", "table", "seal"}
     img = cv2.imread(str(image_path))
     if img is None:
@@ -77,15 +92,19 @@ def crop_figures(image_path: Path, blocks: list, out_dir: Path, page_num: int) -
     saved = []
     fig_idx = 0
     for block in blocks:
-        label = str(block.get("label", block.get("block_label", ""))).lower()
-        bbox = block.get("bbox") or block.get("block_bbox")
+        raw_label = _get_val(block, "label", "block_label", default="")
+        label = str(raw_label).lower()
+        bbox = _get_val(block, "bbox", "block_bbox")
+
         if label not in figure_labels or not bbox or len(bbox) != 4:
             continue
+
         x1, y1, x2, y2 = [int(v) for v in bbox]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         if x2 <= x1 or y2 <= y1:
             continue
+
         fig_idx += 1
         out_dir.mkdir(parents=True, exist_ok=True)
         fig_path = out_dir / f"page_{page_num:04d}_fig{fig_idx}.png"
@@ -110,8 +129,6 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = out_dir / config["output"]["figures_subdir"]
 
-    # Import here so `--help`/matrix-planning paths don't pay the (heavy)
-    # import cost of paddleocr.
     from paddleocr import PaddleOCRVL
     pipeline = PaddleOCRVL(device=ocr_cfg["device"])
 
@@ -129,10 +146,18 @@ def main():
 
         figures = crop_figures(image_path, blocks, figures_dir, page_num)
 
+        # Convert block objects to dicts if required by PageResult JSON serialization
+        serializable_blocks = [
+            b.to_dict() if hasattr(b, "to_dict")
+            else vars(b) if hasattr(b, "__dict__")
+            else b
+            for b in blocks
+        ]
+
         page_result = PageResult(
             page=page_num,
             markdown=markdown,
-            blocks=blocks,
+            blocks=serializable_blocks,
             mean_confidence=mean_conf,
             tesseract_text=tesseract_text,
             figures=figures,
