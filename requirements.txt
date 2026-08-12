@@ -1,0 +1,22 @@
+# Core OCR / VLM engine (CPU build — no CUDA, no paid API)
+paddlepaddle==3.2.1
+paddleocr[doc-parser]>=3.4.0
+
+# PDF rendering / image preprocessing
+pymupdf==1.24.14
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+numpy==1.26.4
+
+# Cross-validation OCR engine
+pytesseract==0.3.13
+
+# Text similarity for cross-engine agreement scoring
+rapidfuzz==3.9.7
+
+# Config / IO
+PyYAML==6.0.2
+
+# Optional LLM structuring assist (only imported if structuring.llm_assist.enabled=true)
+llama-cpp-python==0.3.2
+huggingface_hub==0.25.2

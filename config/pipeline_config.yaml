@@ -1,0 +1,74 @@
+# =============================================================================
+# RPSC/RAS PYQ Extraction Pipeline — configuration
+# Edit these values to tune speed vs accuracy. No code changes needed for
+# most adjustments.
+# =============================================================================
+
+preprocess:
+  dpi: 300                 # render DPI for scanned pages. 300 is the sweet spot
+                            # for small Devanagari conjuncts + math symbols.
+                            # Raise to 350-400 only if a specific paper is very
+                            # low quality (increases OCR time roughly linearly).
+  deskew: true
+  denoise: true
+  clahe_contrast: true      # adaptive contrast — helps photocopied/scanned papers
+
+batching:
+  pages_per_batch: 4        # pages handled by a single matrix job.
+                             # Lower = more parallelism, more per-job overhead.
+                             # Higher = less overhead, less parallelism.
+                             # 4 is tuned for the 20-concurrent-job free limit
+                             # on a 20-40 page paper (5-10 batches).
+  max_concurrent_jobs: 18    # stay under GitHub's 20-job free-tier cap so the
+                             # discover/structure jobs also get a slot.
+
+ocr:
+  engine: "paddleocr_vl"     # primary engine. Do not change unless you have
+                             # benchmarked an alternative on your own papers.
+  paddleocr_vl_model: "PaddleOCR-VL"   # pulls the latest PaddleOCR-VL release
+                                        # via the `paddleocr` package
+  device: "cpu"
+  lang_hint: null            # PaddleOCR-VL auto-detects language per line;
+                              # leave null for mixed Hindi/English pages
+  cross_validate_with_tesseract: true
+  tesseract_langs: "hin+eng"
+
+structuring:
+  # Deterministic, regex/heuristic based question+option+bilingual-pairing.
+  # This is the ONLY component allowed to assemble the final question objects
+  # from OCR text — it never invents characters, it only reorganizes text
+  # PaddleOCR-VL already read.
+  question_number_patterns:
+    - '^\s*Q\.?\s*(\d{1,3})[\.\)]'
+    - '^\s*प्र[श्‍]?\s*[०-९0-9]{1,3}[\.\)]'
+    - '^\s*(\d{1,3})[\.\)]\s'
+  option_label_patterns:
+    - '^\s*\(?([A-Da-d])\)?[\.\)]\s'
+    - '^\s*\(?([1-4])\)?[\.\)]\s'
+    - '^\s*\(?([iI]{1,3}[vV]?)\)?[\.\)]\s'   # roman numeral codes e.g. (i) (ii)
+  devanagari_unicode_range: [2304, 2431]      # U+0900 - U+097F
+  min_devanagari_ratio_for_hindi: 0.25
+
+  # Optional secondary structuring assist (OFF by default). If enabled, a
+  # small local LLM (via llama.cpp) reviews the regex output and proposes
+  # fixes for edge cases the regex missed. Any LLM-only addition is written
+  # to review_queue.json and NEVER silently merged into questions.json.
+  llm_assist:
+    enabled: false
+    model_repo: "Qwen/Qwen2.5-3B-Instruct-GGUF"
+    model_file: "qwen2.5-3b-instruct-q4_k_m.gguf"
+    ctx_size: 8192
+    n_threads: 4
+
+validation:
+  min_ocr_confidence: 0.85
+  min_cross_engine_similarity: 0.55   # rapidfuzz token_sort_ratio / 100
+  expected_option_counts: [2, 3, 4, 5]
+  flag_missing_bilingual_pair: true
+  flag_duplicate_question_numbers: true
+  flag_numbering_gaps: true
+
+output:
+  write_review_queue: true
+  write_debug_markdown: true   # keep raw per-page markdown for audit trail
+  figures_subdir: "figures"
